@@ -10,6 +10,8 @@ A small **Textual** terminal UI to compare prompt wordings side‑by‑side usin
 - **Deterministic runs**: temperature `0.0` and fixed `seed` per run; Configurable
 - **Optional alt generator** (wip): quickly rewrite a dropped prompt into a new variant (non‑deterministic, via LlamaIndex or a direct Ollama fallback).
 
+![TUI](ui.png)
+
 ---
 
 ## Getting started
