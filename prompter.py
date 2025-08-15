@@ -125,7 +125,7 @@ class RunSettings:
 @dataclass
 class GeneratorSettings:
     # For "Generate alternative" only (non-deterministic, separate from evaluation runs)
-    model: str = 'gemma3:270m'
+    model: str = 'mistral-nemo'
     temperature: float = 0.7
     top_p: float = 0.95
     num_ctx: int = 8192
@@ -728,15 +728,14 @@ class PromptEvalApp(App):
 
     async def _generate_alternative(self, slot_id: int) -> None:
         slot = self.state.slots[slot_id - 1]
+        await self._status(f"Generating alternative with {self.state.gen_settings.model} …")
         if not slot.empty:
             await self._drop_slot(slot_id)
         base_text = slot.last_dropped_text or ""
-        await self._status(f'Slot dropped {slot_id} with prompt {slot.last_dropped_text[:30]} ..')
         if not base_text.strip():
             await self._status(f"Slot {slot_id} has no dropped prompt to rewrite. Drop here first with '{slot_id}d'.")
             return
         try:
-            await self._status(f"Generating alternative with {self.state.gen_settings.model} …")
             alt = await self._rewrite_prompt(base_text)
         except Exception as e:
             await self._status(f"Generate alternative failed: {e!s}")
@@ -849,11 +848,13 @@ class PromptEvalApp(App):
             },
         )
         system = (
-            'You are a automatic, technical copy-writer for LLM prompts.'
+            'You are an automatic, technical copy-writer for LLM prompts.'
+        )
+        user = (
             "Rewrite the provided prompt into a clear, distinct alternative for the SAME task. "
             "Respond using ONLY the rewritten prompt."
+            f"Reword this prompt improving its format for more specific LLM runs:\n{dropped_text}"
         )
-        user = f"Reword this prompt improving its format for more specific LLM runs:\n{dropped_text}"
         resp = await llm.acomplete(system_prompt=system, prompt=user)
         text = getattr(resp, "text", None) or str(resp)
         return text.strip()
