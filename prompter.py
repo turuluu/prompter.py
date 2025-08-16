@@ -1,60 +1,39 @@
-# prompt_eval_tui.py
-# Python 3.12
-# A Textual TUI to compare prompt wordings side-by-side with deterministic Ollama generations.
-# - 3 columns, 1 result each, sequential streaming
-# - Global locked sampling params (only wording varies)
-# - Stage-based drop scoring with JSON saves in ~/.prompt-test-saves
-# - Optional "Generate alternative" via LlamaIndex (separate, non-deterministic generator)
-#
-# Install (in a local .venv):
-#   python3.12 -m venv .venv && source .venv/bin/activate
-#   pip install --upgrade pip
-#   pip install textual>=0.58 httpx>=0.27 rich>=13.7 pydantic>=2.7
-#   pip install llama-index>=0.11 llama-index-llms-ollama>=0.2  # optional, for "generate alternative"
-#
-# Run:
-#   python prompt_eval_tui.py
-#
-# Key combos:
-#   1e/2e/3e = edit prompt in that column
-#   1d/2d/3d = mark worst & drop that column (increments stage)
-#   1g/2g/3g = generate alternative into that (empty) column (rewrites dropped prompt)
-#   r = run all (sequential, streaming)
-#   n = manually add new prompt into an empty slot
-#   m = change globals (model/temp/seed/num_ctx/num_predict etc.)
-#   s = save run        o = open run JSON
-#   q = quit
-#
-# Notes:
-# - Defaults: model='gpt-oss', deterministic temperature=0, fixed seed per run.
-# - Uses direct Ollama /api/generate for deterministic control; LlamaIndex used only for "generate alternative".
-# - No auto-pull: you manage models in Ollama.
+"""
+A Textual TUI to compare prompt wordings side-by-side with deterministic generations.
 
-from __future__ import annotations
+Key combos:
+  1e/2e/3e = edit prompt in that column
+  1d/2d/3d = mark worst & drop that column (increments stage)
+  1g/2g/3g = generate alternative into that (empty) column (rewrites dropped prompt)
+  r = run all (sequential, streaming)
+  n = manually add new prompt into an empty slot
+  m = change globals (model/temp/seed/num_ctx/num_predict etc.)
+  s = save run
+  o = open run JSON
+  q = quit
+
+Notes:
+- Defaults: model='gpt-oss', deterministic temperature=0, fixed seed per run.
+- Uses direct Ollama /api/generate for deterministic control; LlamaIndex used only for "generate alternative".
+- No auto-pull: you manage models in Ollama.
+"""
 
 import asyncio
 import json
 import os
-import sys
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, UTC
-from io import StringIO
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import httpx
-from rich.console import Console
 from rich.pretty import Pretty
-from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Container, Horizontal, VerticalScroll, HorizontalGroup
-from textual.message import Message
-from textual.widgets import Footer, Header, Input, Label, Static, Log, RichLog, TextArea, MarkdownViewer
-
-from textual.widgets import Button, TextArea, Label
+from textual.containers import VerticalScroll, HorizontalGroup
+from textual.widgets import Static, RichLog, Button, TextArea, Label
 from textual.widget import Widget
 from textual.message import Message
 
@@ -63,7 +42,7 @@ SAVE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # -------------------------------
-# Data model
+# Data
 # -------------------------------
 
 @dataclass
@@ -186,7 +165,7 @@ class RunState:
             note=data.get("note", ""),
         )
 
-from datetime import datetime
+
 class Status(Message):
     def __init__(self, msg: str):
         super().__init__()
@@ -199,6 +178,7 @@ class Status(Message):
 # -------------------------------
 # UI widgets
 # -------------------------------
+
 class InlineEditor(Static):
     BINDINGS = [
         ("ctrl+s", "save", "Save"),
@@ -456,7 +436,7 @@ class SidePanel(VerticalScroll):
 
 
 # -------------------------------
-# Core App
+# App
 # -------------------------------
 
 class PromptEvalApp(App):
@@ -533,14 +513,13 @@ class PromptEvalApp(App):
     def compose(self) -> ComposeResult:
         # Order matters for grid placement.
         self.side_panel.id = "side"
-        yield self.side_panel  # (1,1) spanning two rows
+        yield self.side_panel
         self.settings_panel.id = "header"
-        yield self.settings_panel  # (1,2) spanning 3 columns
+        yield self.settings_panel
         self.logs_panel.id = "logs"
-        yield self.logs_panel  # (1,2) spanning 3 columns
+        yield self.logs_panel
         self.hints_panel.id = "hints"
-        yield self.hints_panel  # (1,2) spanning 3 columns
-        # Three prompt columns on row 2, columns 2..4
+        yield self.hints_panel
         self.state.slots[0].text = 'What is the capital of France?'
         self.state.slots[0].empty = False
         for i in range(1, 4):
@@ -554,6 +533,7 @@ class PromptEvalApp(App):
         # Side effects only (no layout API calls here on latest Textual).
         self.client = httpx.AsyncClient(timeout=30.0)
         self.side_panel.update_panel()
+        self.side_panel.focus()
 
     async def on_unmount(self) -> None:
         if self.client:
@@ -891,10 +871,6 @@ class PromptEvalApp(App):
         data = resp.json()
         return data.get("response", "").strip()
 
-
-# -------------------------------
-# Entrypoint
-# -------------------------------
 
 if __name__ == "__main__":
     try:

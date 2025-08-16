@@ -1,2 +1,4 @@
 llama-index-llms-ollama # ollama local model
 textual
+rich
+httpx
