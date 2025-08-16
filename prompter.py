@@ -1,21 +1,5 @@
 """
 A Textual TUI to compare prompt wordings side-by-side with deterministic generations.
-
-Key combos:
-  1e/2e/3e = edit prompt in that column
-  1d/2d/3d = mark worst & drop that column (increments stage)
-  1g/2g/3g = generate alternative into that (empty) column (rewrites dropped prompt)
-  r = run all (sequential, streaming)
-  n = manually add new prompt into an empty slot
-  m = change globals (model/temp/seed/num_ctx/num_predict etc.)
-  s = save run
-  o = open run JSON
-  q = quit
-
-Notes:
-- Defaults: model='gpt-oss', deterministic temperature=0, fixed seed per run.
-- Uses direct Ollama /api/generate for deterministic control; LlamaIndex used only for "generate alternative".
-- No auto-pull: you manage models in Ollama.
 """
 
 import asyncio
@@ -33,7 +17,7 @@ from rich.pretty import Pretty
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll, HorizontalGroup
-from textual.widgets import Static, RichLog, Button, TextArea, Label
+from textual.widgets import Static, RichLog, Button, TextArea, Label, Footer
 from textual.widget import Widget
 from textual.message import Message
 
@@ -61,7 +45,7 @@ class OutputRecord:
 
 @dataclass
 class PromptSlot:
-    slot_id: int
+    idx: int = -1
     text: str = ""
     active: bool = True  # false when dropped or empty
     empty: bool = True  # true if slot has no prompt yet
@@ -131,7 +115,7 @@ class RunState:
         slots = []
         for s in data["slots"]:
             ps = PromptSlot(
-                slot_id=s["slot_id"],
+                idx=s.get("idx", 0),
                 text=s.get("text", ""),
                 active=s.get("active", True),
                 empty=s.get("empty", True),
@@ -244,17 +228,6 @@ class InlineEditor(Static):
             self._area.focus()
 
 
-class Hints(Static):
-    def __init__(self, state: RunState) -> None:
-        super().__init__()
-        self.state = state
-
-    def compose(self) -> ComposeResult:
-        yield Label(
-            "\nHints: \n• '1e/2e/3e' edit \n• '1d/2d/3d' drop \n• '1g/2g/3g' alt \n• r run \n• n new \n• m globals \n• s save \n• o open \n• q quit",
-            classes="hints")
-
-
 class Logs(Static):
     def __init__(self, state: RunState) -> None:
         super().__init__()
@@ -262,7 +235,7 @@ class Logs(Static):
         self.status_log: Optional[RichLog] = None
 
     def compose(self) -> ComposeResult:
-        yield Label("\nStatus", classes="side-title")
+        yield Label("Status", classes="side-title")
         self.status_log = RichLog(id="status-log")
         yield self.status_log
 
@@ -339,28 +312,45 @@ class PromptPanel(Static):
     """One column: prompt text + output log."""
 
     class Edited(Message):
-        def __init__(self, slot_id: int, new_text: str) -> None:
-            self.slot_id = slot_id
+        def __init__(self, idx: int, new_text: str) -> None:
+            self.idx = idx
             self.new_text = new_text
             super().__init__()
 
     def __init__(self, slot: PromptSlot) -> None:
         super().__init__()
         self.slot = slot
-        self.prompt_label = Label("", id=f"prompt-label-{slot.slot_id}")
-        self.prompt_text = RichLog(id=f"prompt-text-{slot.slot_id}", highlight=False)
-        self.response = RichLog(id=f"output-log-{slot.slot_id}", highlight=False, wrap=True, min_width=40)
+        self.prompt_text = Static(classes='prompt-text')
+        self.response_panels = RichLog(highlight=False, wrap=True, min_width=40)
         self.editor: InlineEditor | None = None
         self.line = ''
+
+    # ----- callbacks
 
     def compose(self) -> ComposeResult:
         # editor overlays on top of the panel when visible
         self.editor = InlineEditor(self.slot.text, title='Edit prompt (Ctrl+S to save, Esc to cancel)')
         yield self.editor
-        yield Label(f"Prompt {self.slot.slot_id}", classes="title")
+        yield Label(f"Prompt {self.slot.idx}", classes="title")
         yield self.prompt_text
         yield Label("Output", classes="title")
-        yield self.response
+        yield self.response_panels
+
+
+    def on_inline_editor_saved(self, msg: InlineEditor.Saved):
+        text = (msg.text or "").strip()
+        self.slot.text = text
+        self.slot.empty = (text == "")
+        self.slot.active = not self.slot.empty
+        self.refresh_prompt()
+        self.close_editor()
+        # tell siblings (side panel / header) to refresh
+        self.post_message(self.Edited(self.slot.idx, text))
+
+    def on_inline_editor_cancelled(self, _msg: InlineEditor.Cancelled):
+        self.close_editor()
+
+    # ----- explicit
 
     def open_editor(self):
         assert self.editor is not None
@@ -371,42 +361,34 @@ class PromptPanel(Static):
         if self.editor:
             self.editor.add_class("hidden")
 
-    def on_inline_editor_saved(self, msg: InlineEditor.Saved):
-        text = (msg.text or "").strip()
+    def set_prompt(self, text: str) -> None:
         self.slot.text = text
-        self.slot.empty = (text == "")
-        self.slot.active = not self.slot.empty
+        self.slot.empty = False
+        self.slot.active = True
         self.refresh_prompt()
-        self.close_editor()
-        # tell siblings (side panel / header) to refresh
-        self.post_message(self.Edited(self.slot.slot_id, text))
-
-    def on_inline_editor_cancelled(self, _msg: InlineEditor.Cancelled):
-        self.close_editor()
 
     def refresh_prompt(self) -> None:
-        self.prompt_text.clear()
         if self.slot.empty:
-            self.prompt_text.write("[empty slot]  (use 'n' to add or '{id}g' to generate)".format(id=self.slot.slot_id))
+            self.prompt_text.update("[empty slot]  (use 'n' to add or '{id}g' to generate)".format(id=self.slot.idx))
         else:
-            self.prompt_text.write(self.slot.text)
+            self.prompt_text.update(self.slot.text)
 
     def clear_output(self) -> None:
-        self.response.clear()
+        self.response_panels.clear()
 
     def append_output(self, text: str) -> None:
         lines = text.splitlines()
         if len(lines) > 1:
             self.line += lines[0]
-            self.response.write(self.line)
+            self.response_panels.write(self.line)
             self.line = lines[1]
         else:
             self.line += lines[0]
 
     def replace_output(self, text: str) -> None:
-        self.response.clear()
+        self.response_panels.clear()
         if text:
-            self.response.write(text)
+            self.response_panels.write(text)
 
 
 class SidePanel(VerticalScroll):
@@ -419,20 +401,19 @@ class SidePanel(VerticalScroll):
 
     def compose(self) -> ComposeResult:
         yield Label("Prompts & Scores", classes="side-title")
-        for s in self.state.slots:
-            lbl = Label("", id=f"score-{s.slot_id}")
-            self.labels[s.slot_id] = lbl
+        for i, s in enumerate(self.state.slots):
+            lbl = Label("", id=f"score-{s.idx}")
+            self.labels[i] = lbl
             yield lbl
 
     def update_panel(self) -> None:
-
-        for s in self.state.slots:
+        for i, s in enumerate(self.state.slots):
             status = "-" if s.empty else ("x" if s.dropped else "+")
             score = s.current_score(self.state.stage)
-            text = f"[{s.slot_id}] {status}  score={score:.4f}"
+            text = f"[{i}] {status}  score={score:.4f}"
             if not s.empty and not s.dropped:
                 text += f"  born@{s.born_stage}  survived={s.has_survived}"
-            self.labels[s.slot_id].update(text)
+            self.labels[i].update(text)
 
 
 # -------------------------------
@@ -443,23 +424,26 @@ class PromptEvalApp(App):
     CSS = """
     Screen {
         layout: grid;
-        grid-size: 4 2;
+        grid-size: 6 2;
         grid-rows: 13 1fr;
-        grid-columns: 22 1fr 1fr 1fr;
+        grid-columns: 1fr;
     }
     .title { content-align: left middle; padding: 0 1; }
-    .side-title { padding: 0 1; }
+    .side-title { padding: 0 0; }
     #side    { row-span: 1; border: round darkslategrey; }
     #header  { height:20; column-span: 1; border: round darkslategrey; }
-    #hints   { padding: 0 1; column-span: 1; border: round darkslategrey; }
-    #logs    { column-span: 2; border: round darkslategrey; }
+    #logs    { column-span: 4; border: round darkslategrey; }
     
     /* Make each column a stacking context and allow an overlay */
-    #col1, #col2, #col3 { 
+    #col0, #col1, #col2 { 
+        column-span: 2;
         position: relative; 
         border: round darkslategrey;
     }
 
+    .prompt-text {
+        padding: 1 1 2 1;
+    }
     .editor {
         layer: overlay;        /* render above normal content */
         dock: top;
@@ -481,7 +465,9 @@ class PromptEvalApp(App):
     BINDINGS = [
         Binding("r", "run_all", "Run"),
         Binding("n", "add_new", "New"),
-        Binding("m", "edit_globals", "Globals"),
+        Binding("p", "paste_last", "Paste last prompt to new"),
+        Binding("x", "regen_last", "Regenerate last prompt to new"),
+        Binding("g", "edit_globals", "Globals"),
         Binding("s", "save_run", "Save"),
         Binding("o", "open_run", "Open"),
         Binding("q", "quit", "Quit"),
@@ -492,9 +478,8 @@ class PromptEvalApp(App):
         self.state = self._new_run_state()
         self.settings_panel = SettingsPanel(self.state)
         self.side_panel = SidePanel(self.state)
-        self.hints_panel = Hints(self.state)
         self.logs_panel = Logs(self.state)
-        self.panels: Dict[int, PromptPanel] = {}
+        self.prompt_panels: List[PromptPanel] = []
         self.combo_buffer: Optional[int] = None
         self.combo_ts: float = 0.0
         self.client: Optional[httpx.AsyncClient] = None
@@ -507,7 +492,7 @@ class PromptEvalApp(App):
             stage=0,
             settings=RunSettings(),
             gen_settings=GeneratorSettings(),
-            slots=[PromptSlot(slot_id=i + 1, empty=True) for i in range(3)],
+            slots=[PromptSlot(idx=i, empty=True) for i in range(3)],
         )
 
     def compose(self) -> ComposeResult:
@@ -518,16 +503,19 @@ class PromptEvalApp(App):
         yield self.settings_panel
         self.logs_panel.id = "logs"
         yield self.logs_panel
-        self.hints_panel.id = "hints"
-        yield self.hints_panel
-        self.state.slots[0].text = 'What is the capital of France?'
-        self.state.slots[0].empty = False
-        for i in range(1, 4):
-            panel = PromptPanel(self.state.slots[i - 1])
+        default_prompts = [
+            'How much is a trillion divided by fifteen billion?',
+            'How much is 1' + '0' * 12 + '/' + '15' + '0' * 9,
+            'How much is 1 000 000 000 000/15 000 000 000?'
+        ]
+        for i in range(3):
+            panel = PromptPanel(self.state.slots[i])
             panel.id = f"col{i}"
+            panel.set_prompt(default_prompts[i])
             panel.refresh_prompt()
-            self.panels[i] = panel
+            self.prompt_panels.append(panel)
             yield panel
+        yield Footer()
 
     async def on_mount(self) -> None:
         # Side effects only (no layout API calls here on latest Textual).
@@ -558,7 +546,7 @@ class PromptEvalApp(App):
             return
 
         if self.combo_buffer and (now - self.combo_ts) < 1.2:
-            slot = self.combo_buffer
+            slot = self.combo_buffer - 1
             self.combo_buffer = None
 
             if key == "e":
@@ -588,8 +576,8 @@ class PromptEvalApp(App):
         async with self.run_lock:
             # Sequential runs across active, non-empty slots (1->3)
             await self._status(f"Starting run… model={self.state.settings.model}")
-            for i in range(1, 4):
-                slot = self.state.slots[i - 1]
+            for i in range(3):
+                slot = self.state.slots[i]
                 if slot.empty or slot.dropped:
                     await self._status(f"Skip slot {i}: empty={slot.empty} dropped={slot.dropped}")
                     continue
@@ -610,6 +598,48 @@ class PromptEvalApp(App):
             return
         slot = idx + 1
         self.run_worker(self._edit_prompt(slot), exclusive=True)
+
+    def _last(self) -> int | None:
+        for i in range(3,0,-1):
+            j = i - 1
+            if not self.state.slots[j].empty:
+                return j
+
+    def _next(self) -> int | None:
+        for i in range(3):
+            if self.state.slots[i].empty:
+                return i
+
+    async def action_regen_last(self) -> None:
+        if (src := self._last()) is None:
+            await self._status("No prompts to paste.")
+            return
+
+        if (dst := self._next()) is None:
+            await self._status("No empty slots to paste into.")
+            return
+
+        prompt_txt = self.state.slots[src].text
+        rewritten = await self._rewrite_prompt(prompt_txt)
+        self.prompt_panels[dst].set_prompt(rewritten)
+
+        await self._status(f'Pasted from prompt #{src} to #{dst}')
+
+    async def action_paste_last(self) -> None:
+        # copy idx
+        if (last_idx := self._last()) is None:
+            await self._status("No prompts to paste.")
+            return
+
+        # paste idx
+        if (free_idx := self._next()) is None:
+            await self._status("No empty slots to paste into.")
+            return
+
+        text = self.state.slots[last_idx].text
+        self.prompt_panels[free_idx].set_prompt(text)
+
+        await self._status(f'Pasted from prompt #{last_idx} to #{free_idx}')
 
     async def action_edit_globals(self) -> None:
         self.settings_panel.open_editor()
@@ -633,11 +663,9 @@ class PromptEvalApp(App):
             self.state = RunState.from_json(data)
             self.settings_panel.state = self.state
             self.side_panel.state = self.state
-            self.hints_panel.state = self.state
             self.logs_panel.state = self.state
             for i in range(3):
-                self.panels[i + 1].slot = self.state.slots[i]
-            self.refresh_all()
+                self.prompt_panels[i].slot = self.state.slots[i]
         except Exception as e:
             await self._status(f"Open failed: {e}")
 
@@ -676,12 +704,12 @@ class PromptEvalApp(App):
         except Exception:
             pass
 
-    async def _edit_prompt(self, slot_id: int) -> None:
-        panel = self.panels[slot_id]
+    async def _edit_prompt(self, slot_idx: int) -> None:
+        panel = self.prompt_panels[slot_idx]
         panel.open_editor()
 
-    async def _drop_slot(self, slot_id: int) -> None:
-        slot = self.state.slots[slot_id - 1]
+    async def _drop_slot(self, slot_idx: int) -> None:
+        slot = self.state.slots[slot_idx]
         if slot.empty or slot.dropped:
             await self._status("Slot already empty/dropped.")
             return
@@ -700,20 +728,20 @@ class PromptEvalApp(App):
         slot.text = ""
         slot.empty = True
         slot.last_output = ""
-        self.panels[slot_id].slot = slot
-        self.panels[slot_id].refresh_prompt()
-        self.panels[slot_id].clear_output()
+        self.prompt_panels[slot_idx].slot = slot
+        self.prompt_panels[slot_idx].refresh_prompt()
+        self.prompt_panels[slot_idx].clear_output()
         self.side_panel.update_panel()
         self.settings_panel.refresh_panel()
 
-    async def _generate_alternative(self, slot_id: int) -> None:
-        slot = self.state.slots[slot_id - 1]
+    async def _generate_alternative(self, slot_idx: int) -> None:
+        slot = self.state.slots[slot_idx]
         await self._status(f"Generating alternative with {self.state.gen_settings.model} …")
         if not slot.empty:
-            await self._drop_slot(slot_id)
+            await self._drop_slot(slot_idx)
         base_text = slot.last_dropped_text or ""
         if not base_text.strip():
-            await self._status(f"Slot {slot_id} has no dropped prompt to rewrite. Drop here first with '{slot_id}d'.")
+            await self._status(f"Slot {slot_idx} has no dropped prompt to rewrite. Drop here first with '{slot_idx}d'.")
             return
         try:
             alt = await self._rewrite_prompt(base_text)
@@ -729,13 +757,13 @@ class PromptEvalApp(App):
         slot.has_survived = False
         slot.last_output = ""
         slot.history.clear()
-        self.panels[slot_id].slot = slot
-        self.panels[slot_id].refresh_prompt()
+        self.prompt_panels[slot_idx].slot = slot
+        self.prompt_panels[slot_idx].refresh_prompt()
         self.side_panel.update_panel()
 
-    async def _run_one(self, slot_id: int) -> None:
-        slot = self.state.slots[slot_id - 1]
-        panel = self.panels[slot_id]
+    async def _run_one(self, slot_idx: int) -> None:
+        slot = self.state.slots[slot_idx]
+        panel = self.prompt_panels[slot_idx]
         panel.clear_output()
         slot.last_output = ""
         try:
