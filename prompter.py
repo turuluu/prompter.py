@@ -10,9 +10,10 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Iterator
 
 import httpx
+import ollama
 from rich.pretty import Pretty
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -20,6 +21,8 @@ from textual.containers import VerticalScroll, HorizontalGroup
 from textual.widgets import Static, RichLog, Button, TextArea, Label, Footer
 from textual.widget import Widget
 from textual.message import Message
+
+from ollama import chat, ChatResponse
 
 SAVE_DIR = Path(os.path.expanduser("~/.prompt-test-saves"))
 SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -74,6 +77,7 @@ class PromptSlot:
 class RunSettings:
     model: str = 'gemma3:270m'
     temperature: float = 0.0
+    think: bool = False
     top_p: float = 1.0
     top_k: int = 0
     repeat_penalty: float = 1.0
@@ -82,7 +86,6 @@ class RunSettings:
     num_ctx: int = 2048  # default context length
     num_predict: int = 1024  # default max tokens to generate per output
     seed: int = 42
-    base_url: str = "http://localhost:11434"  # Ollama
 
 
 @dataclass
@@ -336,12 +339,12 @@ class PromptPanel(Static):
         yield Label("Output", classes="title")
         yield self.response_panels
 
-
     def on_inline_editor_saved(self, msg: InlineEditor.Saved):
         text = (msg.text or "").strip()
         self.slot.text = text
         self.slot.empty = (text == "")
         self.slot.active = not self.slot.empty
+        self.slot.dropped = self.slot.empty and self.slot.dropped
         self.refresh_prompt()
         self.close_editor()
         # tell siblings (side panel / header) to refresh
@@ -559,13 +562,13 @@ class PromptEvalApp(App):
                 await self._generate_alternative(slot)
                 return
             if key == "n":
-                s = self.state.slots[slot - 1]
+                s = self.state.slots[slot]
                 if not s.empty:
                     await self._status(f"Slot {slot} not empty. Drop first with '{slot}d'.")
                     return
                 await self._edit_prompt(slot)
-                return
-        # fall through to normal single-key bindings
+        else:
+            self.combo_buffer = None
 
     # -------------- Actions
 
@@ -578,7 +581,7 @@ class PromptEvalApp(App):
             await self._status(f"Starting run… model={self.state.settings.model}")
             for i in range(3):
                 slot = self.state.slots[i]
-                if slot.empty or slot.dropped:
+                if slot.empty:
                     await self._status(f"Skip slot {i}: empty={slot.empty} dropped={slot.dropped}")
                     continue
                 await self._status(f"Running slot {i}…")
@@ -596,11 +599,11 @@ class PromptEvalApp(App):
         if idx is None:
             await self._status("No empty slot. Drop one first with 'Xd'.")
             return
-        slot = idx + 1
+        slot = idx
         self.run_worker(self._edit_prompt(slot), exclusive=True)
 
     def _last(self) -> int | None:
-        for i in range(3,0,-1):
+        for i in range(3, 0, -1):
             j = i - 1
             if not self.state.slots[j].empty:
                 return j
@@ -719,13 +722,13 @@ class PromptEvalApp(App):
         slot.dropped = True
         slot.active = False
         slot.last_dropped_text = slot.text
+        slot.text = ""
         slot.final_score = 1.0 / self.state.stage if self.state.stage > 0 else 1.0
         # mark others as having survived at least one drop
         for s in self.state.slots:
             if s is not slot and not s.empty and not s.dropped:
                 s.has_survived = True
         # Clear prompt content to free the slot but retain last_dropped_text for generator.
-        slot.text = ""
         slot.empty = True
         slot.last_output = ""
         self.prompt_panels[slot_idx].slot = slot
@@ -787,49 +790,19 @@ class PromptEvalApp(App):
     async def _ollama_stream(self, prompt: str):
         """Stream generation from Ollama with locked params; yields text chunks."""
         s = self.state.settings
-        url = f"{s.base_url.rstrip('/')}/api/generate"
-        await self._status(f"POST {url} model={s.model}")
-        payload = {
-            "model": s.model,
-            "prompt": prompt,
-            "stream": True,
-            "seed": s.seed,
-            "options": {
-                "temperature": s.temperature,
-                "top_p": s.top_p,
-                "top_k": s.top_k,
-                "repeat_penalty": s.repeat_penalty,
-                "presence_penalty": s.presence_penalty,
-                "frequency_penalty": s.frequency_penalty,
-                "num_ctx": min(max(512, s.num_ctx), 131072),
-                "num_predict": min(max(1, s.num_predict), 131072),
-            },
-        }
         try:
-            async with self.client.stream("POST", url, json=payload) as r:
-                r.raise_for_status()
-                async for line in r.aiter_lines():
-                    if not line:
-                        continue
-                    try:
-                        obj = json.loads(line)
-                    except json.JSONDecodeError:
-                        # Some servers may send "data: {...}" style; strip prefix
-                        if line.startswith("data:"):
-                            try:
-                                obj = json.loads(line[5:].strip())
-                            except Exception:
-                                continue
-                        else:
-                            continue
-                    if "response" in obj and obj.get("done") is not True:
-                        yield obj["response"]
-                    if obj.get("done"):
-                        # Final stats could be used if desired
-                        break
-        except httpx.HTTPError as e:
-            await self._status(f"Ollama HTTP error: {e!s}")
-            raise
+            options = ollama.Options(**asdict(s))
+            messages = [{'role': 'user', 'content': prompt}]
+            response_stream: Iterator[ChatResponse] = chat(model=s.model, think=s.think, options=options, messages=messages,
+                                                           stream=True)
+            final = True
+            for chunk in response_stream:
+                if chunk.message.content:
+                    if not (chunk.message.thinking or chunk.message.thinking == '') and final:
+                        final = False
+                    yield chunk.message.content
+                if chunk.message.thinking:
+                    yield chunk.message.thinking
         except Exception as e:
             await self._status(f"Ollama stream error: {e!s}")
             raise
